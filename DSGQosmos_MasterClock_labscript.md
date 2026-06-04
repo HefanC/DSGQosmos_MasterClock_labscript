@@ -4,9 +4,9 @@
 
 ---
 
-### 构造思路
+## 构造思路
 
-#### 程序组成
+### 程序组成
 
 - `__init__.py` + `register_classes.py`：完成设备类注册，使 BLACS 能加载 `DSGQosmosMasterClock` 和 `DSGQosmosDigitalSignalGenerator`（兼容别名）设备页
 - `labscript_devices.py`：设备核心编译层。定义主时钟类 `DSGQosmosMasterClock`（继承 `PseudoclockDevice`），内部构建 `Pseudoclock → ClockLine → IntermediateDevice（DigitalOut/Trigger bank）` 层次结构。负责：
@@ -52,7 +52,7 @@ sdk_adapter.py
 vendor_dsg（协议编码 → UDP 下发 → DSG 硬件执行）
 ```
 
-#### 触发逻辑
+### 触发逻辑
 
 DSG 作为主时钟时，支持两种角色模式：
 
@@ -83,9 +83,130 @@ DSG 作为主时钟时，支持两种角色模式：
 
 ---
 
-### 使用说明
+## 使用说明
 
-#### 连接表 connection_table
+### 创建通道
+
+DSG 除了实例化设备整体外，还需要实例化每一个通道；每个通道支持实例化为 `DigitalOut` 或 `Trigger` 类，二者区别在于：`Trigger` = `DigitalOut` + 触发能力；详细区别如下：
+
+| 能力                                               |  `DigitalOut`  |       `Trigger`       |
+| -------------------------------------------------- | :------------: | :-------------------: |
+| `go_high(t)` / `go_low(t)` / `pulse(t, width)`     |       ✅        |       ✅（继承）       |
+| `trigger(t, duration)` — 专用的触发脉冲方法        |       ❌        |           ✅           |
+| `trigger_edge_type` — 边沿类型属性                 |       ❌        |           ✅           |
+| `allowed_children`                                 | `[]`（空列表） | `[TriggerableDevice]` |
+| 可作为下游 `PseudoclockDevice` 的 `trigger_device` |       ❌        |           ✅           |
+| 可作为普通 TTL 输出                                |       ✅        |           ✅           |
+
+最关键的差异是 `allowed_children`；在 labscript 框架中，当下游 `PseudoclockDevice` 连接到一个触发通道时，
+框架内部会调用 `trigger_device.add_device(downstream_device)`，此调用检查 `trigger_device.allowed_children`，`DigitalOut` 无 `allowed_children`，下游无法注册
+
+#### 通道创建方式
+
+DSG 主时钟驱动提供**两种互斥**的通道创建方式；用户必须在连接表中选定一种，不能在同一个物理通道上混用
+
+**方式 A：显式创建**
+
+在连接表中显式创建 `DigitalOut` 或 `Trigger` 对象，挂在 `dsg.outputs` 下；`connection` 可以写 `CHX` 或 `doX`（X 为硬件通道号）
+
+```python
+trig = Trigger(name='trig', parent_device=dsg.outputs, connection='CH0',
+               trigger_edge_type='rising')
+ttl  = DigitalOut(name='ttl', parent_device=dsg.outputs, connection='do3')
+```
+
+- 用户完全控制哪些通道被创建、什么类型（`Trigger` vs `DigitalOut`）
+- 未创建的通道不占用 `dsg.outputs.child_devices`，不会出现在 `generate_code()` 的遍历中
+- 符合 labscript 连接表"显式声明所有设备"的规范
+
+**方式 B：`precreate_channels=True`**
+
+```python
+dsg = DSGQosmosMasterClock(
+    name='dsg', precreate_channels=True, ...
+)
+```
+
+开启后，驱动在 `__init__` 中自动为全部 32 个通道（CH0~CH31）各创建一个 `Trigger` 对象：
+
+| 属性 | 值 |
+|------|----|
+| 创建的对象类型 | `Trigger`（不是 `DigitalOut`） |
+| 每个对象的 `name` | `'{dsg.name}_CH{N}'`（如 `'dsg_CH0'`） |
+| 每个对象的 `connection` | `'CH{N}'`（如 `'CH0'`） |
+| `trigger_edge_type` | 继承 DSG 的类属性 `trigger_edge_type`（默认 `'rising'`） |
+| 对象挂载位置 | `dsg.outputs`（`_DSGQosmosDigitalOutputs`），加入 `child_devices` |
+| 可访问属性 | `dsg.CH0`~`dsg.CH31` 和 `dsg.do0`~`dsg.do31`（同对象，两种别名） |
+| 功能 | `go_high` / `go_low` / `pulse`（继承自 `DigitalOut`）+ `trigger()` 方法 + 可连接下游 `TriggerableDevice` |
+
+内部实现（[labscript_devices.py:176-186](DSGQosmos_MasterClock_labscript/labscript_devices.py#L176-L186)）：
+
+```python
+if self.precreate_channels:
+    for channel in range(CHANNEL_COUNT):
+        output = Trigger(
+            f'{name}_CH{channel}',              # labscript 对象名称
+            self.outputs,                        # 父设备
+            f'CH{channel}',                      # 物理连接名
+            trigger_edge_type=self.trigger_edge_type,
+        )
+        self._channels[channel] = output         # 存入字典供 reserve_channel() 使用
+        setattr(self, f'CH{channel}', output)     # dsg.CH0, dsg.CH1, ...
+        setattr(self, f'do{channel}', output)     # dsg.do0, dsg.do1, ...
+```
+
+precreate 后可在实验脚本中直接使用：
+```python
+start()
+dsg.CH0.go_high(1 * ms)
+dsg.CH3.pulse(2 * ms, 100 * us)
+dsg.do5.go_low(3 * ms)
+stop(5 * ms)
+```
+
+**`reserve_channel()` 方法**
+
+`precreate_channels=True` 时，还可以通过 `reserve_channel()` 方法获取预创建的通道对象，用于传给下游设备的 `trigger_device`：
+
+```python
+dsg = DSGQosmosMasterClock(name='dsg', precreate_channels=True, ...)
+
+# 获取预创建的 CH0 Trigger 对象，传给 ASG 作为触发源
+asg = ASGQosmosSignalGenerator(
+    name='asg',
+    trigger_device=dsg.reserve_channel(0),  # 返回 CH0 上的 Trigger
+    trigger_connection='external_trigger',
+    ...
+)
+```
+
+若 `precreate_channels=False`（默认），调用 `reserve_channel()` 会抛出 `LabscriptError`，提示设置 `precreate_channels=True` 或手动创建 `DigitalOut`
+
+**两种方式的冲突检测**
+
+无论哪种方式，`_DSGQosmosDigitalOutputs.add_device()` 都维护一个 `connected_channels` 字典（key = 通道号 0~31，value = 已注册的 `DigitalOut`/`Trigger` 对象）。当尝试添加新设备时：
+
+[labscript_devices.py:67-76](DSGQosmos_MasterClock_labscript/labscript_devices.py#L67-L76)：
+```python
+def add_device(self, device):
+    channel = _channel_number(device.connection)
+    existing = self.connected_channels.get(channel)
+    if existing is not None:
+        raise LabscriptError(
+            f'{...}: DSG channel {device.connection} '
+            f'is already connected by {existing.name}'
+        )
+    self.connected_channels[channel] = device
+    IntermediateDevice.add_device(self, device)
+```
+
+这意味着以下场景**都会触发错误**：
+- 重复创建同通道的实例（无关 `DigitalOut`/`Trigger`）
+- 显式创建了两个指向同一物理通道的对象（如 `do0` 和 `CH0` 指向同一通道）
+- DDS 内部创建的 `Trigger` 与预创建或显式创建的同通道对象冲突
+---
+
+### 连接表 connection_table
 
 在 labscript 的连接表 `connection_table.py` 中添加 Qosmos DSG 主时钟设备，需参考以下规范：
 
@@ -121,25 +242,28 @@ dsg = DSGQosmosMasterClock(
 # ============================================================
 
 # 方式 A：显式创建（推荐，符合 labscript 连接表规范）
-# 用作下游设备触发源的通道 —— 推荐使用 Trigger 类
+
+# --- 用作 ASG 触发源的通道 ---
+# ASG 驱动直接使用传入的 trigger_device 对象调用 go_high()/go_low()，
+# 因此必须预先实例化 Trigger 或 DigitalOut
 trig_asg = Trigger(
     name='trig_asg',
     parent_device=dsg.outputs,
-    connection='do0',               # 物理通道 do0
+    connection='CH0',               # 物理通道 CH0，`connection` 可以写 `CHX` 或 `doX`（X 为通道号）
     trigger_edge_type='rising',     # 上升沿触发
 )
-trig_dds = Trigger(
-    name='trig_dds',
-    parent_device=dsg.outputs,
-    connection='do1',               # 物理通道 do1
-    trigger_edge_type='rising',
-)
+
+# --- 用作 DDS 触发源的通道 ---
+# DDS 驱动在内部自行创建 Trigger 对象（见 DDSQosmosDDS.__init__），
+# 因此不需要（也不能）预先实例化！直接将 dsg.outputs 和通道名传入即可。
+# 若预先实例化 Trigger 再传入 DDS，会导致同一物理通道被两个 Trigger 对象占用，触发冲突错误。
+# （详见下方"3. 连接下游设备"部分）
 
 # 普通 TTL 输出通道 —— 使用 DigitalOut
 ttl_spare = DigitalOut(
     name='ttl_spare',
     parent_device=dsg.outputs,
-    connection='do2',               # 物理通道 do2
+    connection='CH2',               # 物理通道 CH2
 )
 
 # 方式 B：便捷预创建（适合简单脚本，不需要显式创建每个通道对象）
@@ -179,8 +303,10 @@ dds_ch1 = DDSQosmosDDS(
     name='dds_ch1',
     parent_device=dds,
     channel=1,
-    trigger_device=dsg.outputs,     # 对于 DDS，直接传 dsg.outputs
-    trigger_connection='do1',       # 和通道名即可，不需要先实例化 Trigger
+    trigger_device=dsg.outputs,     # 直接传 dsg.outputs（IntermediateDevice）
+    trigger_connection='do1',       # DDS 内部自行创建 Trigger 到此通道
+    # 注意：不能预先实例化 Trigger(..., connection='do1') 再传入，
+    # 否则 DDS 内部再创建一个 Trigger 到同一通道会导致冲突
 )
 ```
 
@@ -200,7 +326,7 @@ dsg = DSGQosmosMasterClock(
 ttl = DigitalOut(name='ttl', parent_device=dsg.outputs, connection='do0')
 ```
 
-#### 实验脚本
+### 实验脚本
 
 **作为 Master Pseudoclock 时的实验脚本：**
 
@@ -275,7 +401,7 @@ ttl.go_low(t + 1.5)
 stop(t + 3.0)
 ```
 
-#### BLACS GUI 手动控制
+### BLACS GUI 手动控制
 
 1. 在 BLACS 界面中选中 DSG 设备页
 2. 点击 "Manual" 进入手动模式，显示 32 个通道的 checkbox
@@ -284,7 +410,7 @@ stop(t + 3.0)
 5. **只修改被操作的通道**，其他通道保持原有状态（即使正在按实验脚本输出也不受影响）
 6. 点击 "Buffered" 返回流模式，所有手动控制释放，通道恢复自动模式
 
-#### 注意事项
+### 注意事项
 
 - DSG 设备硬件连接参考 Qosmos DSG 操作手册；设备默认 IP 为 `192.168.1.10`，UDP 端口 `5001`
 - 如果出现连接不上的情况，可以尝试在连好网线后重启 DSG，等待一段时间后再尝试
@@ -294,5 +420,6 @@ stop(t + 3.0)
 - `precreate_channels=True` 会预创建全部 32 个 `Trigger` 通道（`dsg.CH0`~`dsg.CH31`），适合简单脚本；显式创建方式适合需要精确控制哪些通道被使用的场景
 - 若 `stop(t)` 设置过早，在波形还没有输出完实验就结束了，DSG 会在结束时根据当前状态输出终态电平
 - Qosmos DSG 的时间分辨率为 10 ns（`dt=10e-9`），所有事件时间必须为 10 ns 的整数倍
-- DDS 设备连接 DSG 触发时，无需先实例化触发通道对象，直接将 `dsg.outputs` 和 `connection='doN'` 传入 DDS 通道的 `trigger_device` 和 `trigger_connection` 即可
-- ASG 设备连接 DSG 触发时，需要先实例化触发通道（`Trigger` 或 `DigitalOut`），再传入 ASG 的 `trigger_device`
+- **DDS 连接 DSG 触发**：直接将 `dsg.outputs`（IntermediateDevice）和 `connection='doN'` 传入 DDS 通道。DDS 驱动在内部自行创建 `Trigger` 对象挂载到 `dsg.outputs`上。**不能预先实例化 Trigger**——否则同一物理通道会被两个 Trigger 占用，触发冲突错误
+- **ASG 连接 DSG 触发**：必须预先实例化（`Trigger` 或 `DigitalOut` 挂在 `dsg.outputs` 上），再将对象传入 ASG。ASG 驱动直接使用该对象调用 `go_high()`/`go_low()`，不会内部再创建新对象
+- **两种模式差异的原因**：取决于下游驱动如何消费 `trigger_device` 参数——DDS 将其作为 `Trigger` 的 `parent_device` 传入 `Trigger.__init__()`，而 ASG 直接通过 `hasattr(obj, "go_high")` 检查后调用方法
