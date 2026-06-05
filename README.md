@@ -37,12 +37,12 @@ dsg = DSGQosmosMasterClock(
     ip='192.168.1.10', port=5001,
 )
 
-# 触发源通道（推荐用 Trigger 类）
-trig_dds = Trigger(name='trig_dds', parent_device=dsg.outputs,
-                   connection='do0', trigger_edge_type='rising')
+# 用作下游设备触发源的通道（推荐用 Trigger 类）
+trig_asg = Trigger(name='trig_asg', parent_device=dsg.outputs,
+                   connection='CH0', trigger_edge_type='rising')
 
 # 普通 TTL 通道
-ttl = DigitalOut(name='ttl', parent_device=dsg.outputs, connection='do2')
+ttl = DigitalOut(name='ttl', parent_device=dsg.outputs, connection='CH2')
 ```
 
 ### 2. 实验脚本
@@ -54,18 +54,19 @@ start()
 
 ttl.go_high(0.5)
 ttl.go_low(1.5)
-ttl.pulse(2.0, duration=10e-6)
-
-# 下游设备自动触发（无需手动写触发命令）
-dds_ch1.setfreq(1e-3, 20e6)
+ttl.go_high(2.0)
+ttl.go_low(2.0 + 10e-6)
 
 stop(5e-3)
 ```
 
 ### 3. BLACS GUI
 
-- 切换到 "Manual" 标签页，勾选/取消勾选通道 checkbox
-- 只修改被操作的通道，不影响其余通道（即使正在按实验脚本输出）
+- 切换到 "Manual" 标签页，勾选/取消勾选通道 checkbox，立即生效
+- **实验运行期间**也可以直接在界面上勾选/取消通道，实时 overwrite 对应通道输出，其余通道继续按脚本执行
+- 只修改被操作的通道，不影响其余通道
+
+> **完整用法**（连接 DDS、ASG 下游设备、Secondary Pseudoclock 模式、`precreate_channels` 等）详见 [DSGQosmos_MasterClock_labscript.md](DSGQosmos_MasterClock_labscript.md)。
 
 ## 详细文档
 

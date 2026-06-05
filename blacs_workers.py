@@ -17,6 +17,7 @@ class DSGQosmosMasterClockWorker(Worker):
         )
         self.adapter.connect()
         self.manual_high_mask = 0    # channels currently forced high by the user
+        self._gui_state_mask = 0     # last GUI state for smart-programming diff
         self.buffered_start_time = None
         self.buffered_stop_time = 0.0
         self.buffered_armed = False
@@ -50,7 +51,20 @@ class DSGQosmosMasterClockWorker(Worker):
         if self.buffered_armed and self.buffered_trigger_source != 'software':
             self.buffered_start_time = time.time()
 
-        return self._mask_to_front_panel_values(self.manual_high_mask)
+        # Extract initial output state from the stream program for the
+        # smart-programming GUI so that the front-panel checkboxes reflect
+        # the actual first state of the stream (skip SEGMENT_MARKER rows).
+        initial_state = 0
+        for row in program:
+            reps = int(row['reps'])
+            state = int(row['state'])
+            if reps == 0xFFFFFFFF and state == 0:
+                continue
+            initial_state = state
+            break
+        self._gui_state_mask = initial_state
+        self.manual_high_mask = 0   # reset manual overrides for the new shot
+        return self._mask_to_front_panel_values(initial_state)
 
     def start_run(self):
         if self.buffered_armed and self.buffered_trigger_source == 'software':
@@ -63,24 +77,28 @@ class DSGQosmosMasterClockWorker(Worker):
         self.buffered_stop_time = 0.0
         self.buffered_armed = False
         self.buffered_trigger_source = 'external'
-        if self.manual_high_mask:
-            self.adapter.update_manual_channels(
-                high_mask=self.manual_high_mask, low_mask=0,
-            )
-        else:
-            self.adapter.release_manual_channels()
-        return self._mask_to_front_panel_values(self.manual_high_mask)
+        # Put every channel into full manual mode with its last known
+        # GUI state (handles both high and low correctly, unlike the
+        # old path which only set high_mask).
+        self.adapter.set_channels_manual(
+            manual_en=0xFFFFFFFF,
+            manual_val=self._gui_state_mask,
+        )
+        self.manual_high_mask = self._gui_state_mask
+        return self._mask_to_front_panel_values(self._gui_state_mask)
 
     def program_manual(self, values):
-        new_high_mask = self._front_panel_values_to_mask(values)
-        old_high_mask = self.manual_high_mask
-        newly_high = new_high_mask & ~old_high_mask   # user just checked these
-        newly_low  = old_high_mask & ~new_high_mask   # user just unchecked these
+        new_mask = self._front_panel_values_to_mask(values)
+        old_mask = self._gui_state_mask
+        newly_high = new_mask & ~old_mask   # user just checked these
+        newly_low  = old_mask & ~new_mask   # user just unchecked these
 
-        self.adapter.update_manual_channels(
-            high_mask=newly_high, low_mask=newly_low,
-        )
-        self.manual_high_mask = new_high_mask
+        if newly_high or newly_low:
+            self.adapter.update_manual_channels(
+                high_mask=newly_high, low_mask=newly_low,
+            )
+        self._gui_state_mask = new_mask
+        self.manual_high_mask = new_mask    # keep in sync for transition_to_manual
         return values
 
     def get_status_text(self):
@@ -111,14 +129,14 @@ class DSGQosmosMasterClockWorker(Worker):
     def _front_panel_values_to_mask(values):
         mask = 0
         for channel in range(32):
-            if values[f'CH{channel}']:
+            if values[f'CH{channel:02d}']:
                 mask |= 1 << channel
         return mask
 
     @staticmethod
     def _mask_to_front_panel_values(mask):
         return {
-            f'CH{channel}': bool(mask & (1 << channel))
+            f'CH{channel:02d}': bool(mask & (1 << channel))
             for channel in range(32)
         }
 
