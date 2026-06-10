@@ -53,12 +53,19 @@ class DSGQosmosMasterClockTab(DeviceTab):
                 self.primary_worker, 'program_manual', current
             )
             self._last_smart_values = current.copy()
-            # Skip the done check this iteration so that rapid user
-            # edits are pushed to the hardware with low latency.
-            self.wait_until_done(notify_queue)
+            # After a GUI overwrite, force an immediate completion check
+            # so that the 1-Hz throttle in check_if_done does not add
+            # extra delay after the last user interaction.
+            done = yield self.queue_work(
+                self.primary_worker, 'check_if_done', True
+            )
+            if done:
+                notify_queue.put('done')
+            else:
+                self.wait_until_done(notify_queue)
             return
 
-        # ---- check whether the shot has finished ----
+        # ---- no GUI change: normal throttled completion check ----
         done = yield self.queue_work(self.primary_worker, 'check_if_done')
         if done:
             notify_queue.put('done')

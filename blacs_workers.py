@@ -23,6 +23,14 @@ class DSGQosmosMasterClockWorker(Worker):
         self.buffered_armed = False
         self.buffered_trigger_source = 'external'
 
+        # ---- throttled status polling ----
+        self._last_status_query_time = 0.0   # timestamp of last CMD_STATUS query
+        self._min_query_interval = 1.0        # minimum interval between hw queries (1 Hz)
+        self._completion_buffer = 0.2         # extra time for CMD_SWR UDP latency before
+                                              # the first hardware status confirmation
+        self._hard_timeout_extra = 30.0       # max extra wait beyond stop_time if DSG
+                                              # never confirms idle (e.g. UDP broken)
+
     def transition_to_buffered(self, device_name, h5file, initial_values, fresh):
         with h5py.File(h5file, 'r') as hdf5_file:
             group = hdf5_file[f'devices/{device_name}']
@@ -112,15 +120,59 @@ class DSGQosmosMasterClockWorker(Worker):
     def abort_transition_to_buffered(self):
         return self.abort_buffered()
 
-    def check_if_done(self):
+    def check_if_done(self, force_query=False):
+        """Return True when the buffered shot has finished.
+
+        Strategy (avoid overwhelming the DSG embedded UDP stack):
+
+        * Before *stop_time + buffer*  — no hardware query at all; the DSG
+          FPGA executes the stream for a deterministic duration known at
+          compile time, so we can safely return False without touching the
+          network.
+        * After *stop_time + buffer*  — throttled hardware confirmation at
+          most once per ``_min_query_interval`` (default 1 Hz).  Once the
+          DSG reports STATUS_IDLE we return True.
+        * If the DSG never confirms idle (UDP broken / firmware stuck), a
+          hard timeout (``_hard_timeout_extra`` beyond stop_time) forces
+          completion so that BLACS is not blocked forever.
+
+        Parameters
+        ----------
+        force_query : bool
+            When True, bypass the throttle interval in phase 2 so that a
+            hardware status query is issued immediately (unless we are still
+            in phase 1, where the experiment cannot possibly be done yet).
+            Used after a GUI overwrite so that the completion check is not
+            delayed by the 1-Hz window.
+        """
         if self.buffered_start_time is None:
             return True
+
+        elapsed = time.time() - self.buffered_start_time
+
+        # ---- phase 1: before expected completion — no network I/O ----
+        if elapsed < self.buffered_stop_time + self._completion_buffer:
+            return False
+
+        # ---- phase 2: near / after expected completion — throttled query ----
+        now = time.time()
+        if not force_query and (now - self._last_status_query_time < self._min_query_interval):
+            return False   # within the throttle window
+
+        self._last_status_query_time = now
+
         if self.buffered_armed:
             status_code = self.adapter.get_status_code()
-            if status_code is not None:
-                return status_code == self.adapter.STATUS_IDLE
-        elapsed = time.time() - self.buffered_start_time
-        return elapsed >= self.buffered_stop_time
+            if status_code == self.adapter.STATUS_IDLE:
+                return True
+            if status_code is None:
+                # UDP appears broken — fall back to time-based judgment.
+                # DSG FPGA execution is deterministic in master mode;
+                # the completion_buffer provides a conservative margin.
+                return elapsed >= self.buffered_stop_time + self._completion_buffer
+
+        # ---- phase 3: hard timeout — prevent infinite wait ----
+        return elapsed >= self.buffered_stop_time + self._hard_timeout_extra
 
     def shutdown(self):
         self.adapter.disconnect()
